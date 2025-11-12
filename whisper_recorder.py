@@ -8,6 +8,7 @@ from faster_whisper import WhisperModel
 from post_process_transcript2 import process_transcript, summarize_transcript
 from waveform_widget import WaveformWidget
 from set_path import RECORDINGS_DIR
+import ctranslate2
 
 
 # === Whisper Recorder ===
@@ -67,10 +68,20 @@ class WhisperRecorder(QtWidgets.QWidget):
         self.running = False
 
         # ==== Model ====
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model = WhisperModel("small", device=device, compute_type="float16")
-        self.text_area.append(f"✅ Loaded Whisper 'small' on {device}\n")
+        try:
+            has_cuda = ctranslate2.get_cuda_device_count()> 0
+        except Exception:
+            has_cuda = False
 
+        if has_cuda:
+            device = "cuda"
+            compute_type = "float16"   # good for real NVIDIA GPU
+        else:
+            device = "cpu"
+            compute_type = "int8"      # good default for CPU
+
+        self.model = WhisperModel("small", device=device, compute_type=compute_type)
+        self.text_area.append(f"✅ Loaded Whisper 'small' on {device} ({compute_type})\n")
         #os.makedirs("recordings", exist_ok=True)
         self.text_file = None
         self.wave_file = None
