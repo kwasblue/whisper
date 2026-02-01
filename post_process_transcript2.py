@@ -1,8 +1,16 @@
+"""
+Post-processing pipeline for transcripts using a local LLM.
+
+This module provides functions to clean, merge, and summarize transcripts
+using a quantized Mistral model via llama-cpp-python. It handles timestamp
+parsing, grammar correction, and metadata generation.
+"""
+
 import re
 from pathlib import Path
 from llama_cpp import Llama
 from datetime import datetime
-import json, re, wave
+import json, wave
 
 
 # === PATHS ===
@@ -10,9 +18,44 @@ LOCAL_MISTRAL_PATH = Path(
     r"whisper\models\mistral\mistral-7b-instruct-v0.2.Q4_K_M.gguf"
 )
 
+# === CACHED LLM INSTANCE ===
+_llm_instance = None
+
+
+def _get_llm(n_ctx=4096):
+    """
+    Get or create a cached LLM instance to avoid repeated model loading.
+
+    Args:
+        n_ctx: Context window size for the model.
+
+    Returns:
+        Llama: The cached or newly created LLM instance.
+    """
+    global _llm_instance
+    if _llm_instance is None:
+        if not LOCAL_MISTRAL_PATH.exists():
+            raise FileNotFoundError(f"Missing local model: {LOCAL_MISTRAL_PATH}")
+        print("🧠 Loading Mistral model (first use)...")
+        _llm_instance = Llama(
+            model_path=str(LOCAL_MISTRAL_PATH),
+            n_ctx=n_ctx,
+            n_threads=6,
+            n_gpu_layers=-1,
+        )
+    return _llm_instance
+
 # === HELPERS ===
 def merge_transcript(txt_path):
-    """Combine timestamped lines into chronological paragraph."""
+    """
+    Combine timestamped lines into a single chronological paragraph.
+
+    Args:
+        txt_path: Path to transcript file with [MM:SS] timestamps.
+
+    Returns:
+        Path: Path to the merged output file (*_merged.txt).
+    """
     txt_path = Path(txt_path)
     with open(txt_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
@@ -26,7 +69,7 @@ def merge_transcript(txt_path):
             entries.append((t, text))
 
     entries.sort(key=lambda x: x[0])
-    merged_text = " ".join([t[1].strip() for t in entries])
+    merged_text = " ".join(t[1].strip() for t in entries)  # Use generator
     out_path = txt_path.with_name(txt_path.stem + "_merged.txt")
     out_path.write_text(merged_text, encoding="utf-8")
     return out_path
@@ -34,9 +77,19 @@ def merge_transcript(txt_path):
 
 # === LOCAL CLEANUP ===
 def clean_with_local_mistral(file_path):
-    """Fix grammar/punctuation locally using a quantized Mistral GGUF model."""
-    if not LOCAL_MISTRAL_PATH.exists():
-        print(f"❌ Missing local model: {LOCAL_MISTRAL_PATH}")
+    """
+    Fix grammar, punctuation, and spelling using a local Mistral model.
+
+    Args:
+        file_path: Path to the transcript file to clean.
+
+    Returns:
+        Path: Path to the cleaned output file (*_clean.txt), or None if failed.
+    """
+    try:
+        llm = _get_llm(n_ctx=4096)
+    except FileNotFoundError as e:
+        print(f"❌ {e}")
         return None
 
     text = Path(file_path).read_text(encoding="utf-8")
@@ -49,14 +102,7 @@ def clean_with_local_mistral(file_path):
         + text
     )
 
-    print("🧠 Running local Mistral cleanup (GGUF)...")
-
-    llm = Llama(
-        model_path=str(LOCAL_MISTRAL_PATH),
-        n_ctx=4096,
-        n_threads=6,          # adjust for your CPU cores
-        n_gpu_layers=-1       # auto GPU offload if available (Metal/CUDA)
-    )
+    print("🧠 Running local Mistral cleanup...")
 
     response = llm.create_chat_completion(
         messages=[{"role": "user", "content": prompt}],
@@ -75,12 +121,16 @@ def clean_with_local_mistral(file_path):
 # === MAIN PIPELINE ===
 def process_transcript(txt_path):
     """
-    Detects whether the transcript includes timestamps like [00:12].
-    If timestamps exist -> merge + clean.
-    If no timestamps -> clean directly.
+    Process a transcript: detect timestamps, merge if needed, and clean with LLM.
+
+    Args:
+        txt_path: Path to the transcript file.
+
+    Returns:
+        Path: Path to the cleaned transcript file, or None if processing failed.
     """
     txt_path = Path(txt_path)
-    raw_text = txt_path.read_text(encoding="utf-8")
+
     # Normalize transcript path
     if txt_path.suffix != ".txt":
         txt_path = txt_path.with_suffix(".txt")
@@ -91,32 +141,39 @@ def process_transcript(txt_path):
         if alt.exists():
             txt_path = alt
 
-    has_timestamps = bool(re.search(r"\[\d{2}:\d{2}\]", raw_text))
-    print(f"🔍 Checking transcript: {'timestamps found' if has_timestamps else 'no timestamps'}")
+    raw_text = txt_path.read_text(encoding="utf-8")
 
     if not raw_text.strip():
         print("⚠️ Transcript is empty — skipping cleanup.")
         return None
+
+    has_timestamps = bool(re.search(r"\[\d{2}:\d{2}\]", raw_text))
+    print(f"🔍 Checking transcript: {'timestamps found' if has_timestamps else 'no timestamps'}")
 
     target_path = merge_transcript(txt_path) if has_timestamps else txt_path
     cleaned = clean_with_local_mistral(target_path)
 
     if cleaned and Path(cleaned).exists():
         orig_wc = len(raw_text.split())
-        new_wc = len(Path(cleaned).read_text(encoding='utf-8').split())
+        cleaned_text = Path(cleaned).read_text(encoding='utf-8')
+        new_wc = len(cleaned_text.split())
         print(f"✨ Cleaned transcript: {cleaned} ({orig_wc} → {new_wc} words)")
     else:
         print("⚠️ Cleanup failed or produced no output.")
 
     return cleaned
 
-# sumarize the transcript generate metadata
-def summarize_transcript(file_path, model_path=None):
+def summarize_transcript(file_path):
     """
-    Generate a short summary and title from a transcript using local Mistral.
-    Returns metadata dict and saves it as JSON beside the transcript.
-    """
+    Generate a title and summary from a transcript using the local Mistral model.
 
+    Args:
+        file_path: Path to the transcript file.
+
+    Returns:
+        dict: Metadata containing title, summary, duration, timestamp, and status.
+              Returns None if the transcript is empty.
+    """
     txt_path = Path(file_path)
     text = txt_path.read_text(encoding="utf-8").strip()
 
@@ -124,7 +181,6 @@ def summarize_transcript(file_path, model_path=None):
         print("⚠️ Transcript empty, skipping summary.")
         return None
 
-    # === Prompt ===
     prompt = (
         "You are an assistant creating metadata for a recording transcript.\n"
         "1. Write a short, clear title (5–10 words max).\n"
@@ -137,22 +193,17 @@ def summarize_transcript(file_path, model_path=None):
     meta_partial = {}
 
     try:
-        llm = Llama(
-            model_path=model_path or r"C:\Users\kwasi\OneDrive\Documents\Personal Projects\whisper\models\mistral\mistral-7b-instruct-v0.2.Q4_K_M.gguf",
-            n_ctx=2048,
-            n_threads=8,
-            n_gpu_layers=-1,
-        )
+        llm = _get_llm(n_ctx=4096)
         result = llm(prompt, max_tokens=128, temperature=0.4)
         raw_text = result["choices"][0]["text"].strip()
         print(f"🧠 Raw LLM output:\n{raw_text}\n")
 
-        # === Try to parse JSON ===
+        # Try to parse JSON
         try:
             meta_partial = json.loads(raw_text)
         except json.JSONDecodeError:
             # Try extracting JSON block if text contains extra info
-            match = re.search(r'\{[\s\S]*\}', raw_text)
+            match = re.search(r'\{[\s\S]*?\}', raw_text)
             if match:
                 try:
                     meta_partial = json.loads(match.group(0))
@@ -174,19 +225,19 @@ def summarize_transcript(file_path, model_path=None):
         print(f"⚠️ Summary generation failed: {e}")
         meta_partial = {"title": "Untitled Session", "summary": "Summary unavailable."}
 
-    # === Compute duration (if audio exists) ===
+    # Compute duration (if audio exists)
     audio_path = txt_path.with_suffix(".wav")
     duration = None
     if audio_path.exists():
         try:
-            with wave.open(audio_path, "rb") as wf:
+            with wave.open(str(audio_path), "rb") as wf:
                 frames = wf.getnframes()
                 rate = wf.getframerate()
                 duration = f"{frames / rate / 60:.1f} min"
         except Exception as e:
             print(f"⚠️ Could not read duration: {e}")
 
-    # === Build final metadata ===
+    # Build final metadata
     meta = {
         "title": meta_partial.get("title", "Untitled Session").strip(),
         "summary": meta_partial.get("summary", "Summary unavailable.").strip(),
@@ -196,7 +247,7 @@ def summarize_transcript(file_path, model_path=None):
         "source": str(txt_path.name),
     }
 
-    # === Save metadata JSON ===
+    # Save metadata JSON
     meta_path = txt_path.with_suffix(".json")
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     print(f"🗂️ Metadata saved to: {meta_path}")

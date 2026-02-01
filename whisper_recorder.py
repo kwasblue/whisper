@@ -1,3 +1,11 @@
+"""
+Real-time audio recording and transcription using OpenAI Whisper.
+
+This module provides a Qt widget for capturing audio from the microphone,
+performing voice activity detection (VAD), and transcribing speech in real-time.
+It also supports loading and transcribing existing audio files.
+"""
+
 import os, queue, threading, time, wave, datetime, librosa, tempfile, soundfile
 import webrtcvad, torch
 import numpy as np
@@ -10,9 +18,21 @@ from waveform_widget import WaveformWidget
 from set_path import RECORDINGS_DIR
 import ctranslate2
 
+# Maximum audio buffer size (5 minutes at 16kHz, 16-bit mono)
+MAX_BUFFER_BYTES = 16000 * 2 * 60 * 5
 
-# === Whisper Recorder ===
+
 class WhisperRecorder(QtWidgets.QWidget):
+    """
+    A Qt widget for recording audio and transcribing it using Whisper.
+
+    Features:
+        - Real-time recording with voice activity detection
+        - Automatic utterance segmentation based on silence detection
+        - Live transcription with timestamps
+        - Audio file loading and batch transcription
+        - Waveform visualization and playback
+    """
     def __init__(self):
         super().__init__()
         self.setWindowTitle("🎙️ Whisper Recorder (VAD + Timestamped + Waveform)")
@@ -24,6 +44,8 @@ class WhisperRecorder(QtWidgets.QWidget):
         print(f"📂 WhisperRecorder using directory: {self.recordings_dir}")
         # ==== GUI ====
         layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
 
         # Splitter: waveform (top) + text (bottom)
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
@@ -34,21 +56,40 @@ class WhisperRecorder(QtWidgets.QWidget):
         self.splitter.setSizes([350, 250])
         layout.addWidget(self.splitter)
 
-        # Buttons
-        self.start_btn = QtWidgets.QPushButton("▶️ Start Recording")
-        self.stop_btn = QtWidgets.QPushButton("⏹ Stop Recording")
-        self.play_btn = QtWidgets.QPushButton("🔊 Play")
-        self.pause_btn = QtWidgets.QPushButton("⏸ Pause")
-        self.load_btn = QtWidgets.QPushButton("📂 Load Audio File")
-        self.cancel_btn = QtWidgets.QPushButton("❌ Cancel Transcription")
+        # Buttons with object names for styling
+        self.start_btn = QtWidgets.QPushButton("▶  Start")
+        self.start_btn.setObjectName("startBtn")
+
+        self.stop_btn = QtWidgets.QPushButton("⏹  Stop")
+        self.stop_btn.setObjectName("stopBtn")
+
+        self.play_btn = QtWidgets.QPushButton("▶  Play")
+        self.play_btn.setObjectName("playBtn")
+
+        self.pause_btn = QtWidgets.QPushButton("⏸  Pause")
+        self.pause_btn.setObjectName("pauseBtn")
+
+        self.load_btn = QtWidgets.QPushButton("📂  Load File")
+        self.load_btn.setObjectName("loadBtn")
+
+        self.cancel_btn = QtWidgets.QPushButton("✕  Cancel")
+        self.cancel_btn.setObjectName("cancelBtn")
 
         self.stop_btn.setEnabled(False)
         self.cancel_btn.setEnabled(False)
 
-        # Button Layout
+        # Button Layout with spacing
         btns = QtWidgets.QHBoxLayout()
-        for b in [self.start_btn, self.stop_btn, self.play_btn, self.pause_btn, self.load_btn, self.cancel_btn]:
-            btns.addWidget(b)
+        btns.setSpacing(8)
+        btns.addWidget(self.start_btn)
+        btns.addWidget(self.stop_btn)
+        btns.addSpacing(16)
+        btns.addWidget(self.play_btn)
+        btns.addWidget(self.pause_btn)
+        btns.addSpacing(16)
+        btns.addWidget(self.load_btn)
+        btns.addWidget(self.cancel_btn)
+        btns.addStretch()
         layout.addLayout(btns)
 
         # Connect
@@ -65,7 +106,10 @@ class WhisperRecorder(QtWidgets.QWidget):
         self.frame_len = int(self.sample_rate * self.frame_ms / 1000)
         self.vad = webrtcvad.Vad(2)
         self.audio_q = queue.Queue()
-        self.running = False
+
+        # Thread synchronization
+        self._running = threading.Event()
+        self._cancel = threading.Event()
 
         # ==== Model ====
         try:
@@ -86,18 +130,23 @@ class WhisperRecorder(QtWidgets.QWidget):
         self.text_file = None
         self.wave_file = None
 
-    # === Audio callback ===
     def _audio_callback(self, indata, frames, time_info, status):
+        """Callback invoked by sounddevice for each audio frame."""
         if status:
             print(status)
-        if self.running:
+        if self._running.is_set():
             self.audio_q.put(indata.copy())
 
-    # === Start ===
     def start_recording(self):
-        if self.running:
+        """
+        Begin audio capture and real-time transcription.
+
+        Opens the microphone stream, starts VAD-based processing in a background
+        thread, and creates output files for the audio and transcript.
+        """
+        if self._running.is_set():
             return
-        self.running = True
+        self._running.set()
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.text_area.append("🎧 Listening...\n")
@@ -122,11 +171,16 @@ class WhisperRecorder(QtWidgets.QWidget):
 
         threading.Thread(target=self._process_audio, daemon=True).start()
 
-    # === Stop ===
     def stop_recording(self):
-        if not self.running:
+        """
+        Stop audio capture and finalize output files.
+
+        Closes the audio stream, saves the WAV and transcript files,
+        loads the waveform for playback, and runs post-processing.
+        """
+        if not self._running.is_set():
             return
-        self.running = False
+        self._running.clear()
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.text_area.append("\n🛑 Stopped.\n")
@@ -156,28 +210,38 @@ class WhisperRecorder(QtWidgets.QWidget):
         except Exception as e:
             self.text_area.append(f"⚠️ Post-processing failed: {e}\n")
 
-    # === Processing ===
     def _process_audio(self):
+        """
+        Background thread for VAD-based audio processing.
+
+        Reads audio frames from the queue, detects speech using WebRTC VAD,
+        and triggers transcription when silence is detected after speech.
+        Includes protection against unbounded buffer growth.
+        """
         ring = bytearray()
         silence_frames = 0
         speaking = False
         start_time = time.time()
 
-        while self.running:
+        while self._running.is_set():
             try:
                 indata = self.audio_q.get(timeout=1)
             except queue.Empty:
                 continue
 
-            self.wave_file.writeframes(indata.tobytes())
-
             frame_bytes = indata.tobytes()
+            self.wave_file.writeframes(frame_bytes)
             is_speech = self.vad.is_speech(frame_bytes, self.sample_rate)
 
             if is_speech:
                 ring.extend(frame_bytes)
                 silence_frames = 0
                 speaking = True
+                # Prevent unbounded buffer growth - force transcription at max size
+                if len(ring) >= MAX_BUFFER_BYTES:
+                    self._transcribe_utterance(ring, start_time)
+                    ring.clear()
+                    start_time = time.time()
             elif speaking:
                 silence_frames += 1
                 if silence_frames > 10:
@@ -207,20 +271,26 @@ class WhisperRecorder(QtWidgets.QWidget):
                 QtCore.Q_ARG(str, f"🗣️ {line}")
             )
 
-    # === Cancel ===
     def cancel_transcription(self):
-        self.cancel_flag = True
+        """Request cancellation of the current file transcription."""
+        self._cancel.set()
         self.text_area.append("\n⏹ Cancel requested — will stop after current chunk.\n")
 
-    # === Playback ===
     def play_audio(self):
+        """Start audio playback with synchronized waveform cursor."""
         self.waveform.play()
 
     def pause_audio(self):
+        """Pause audio playback."""
         self.waveform.pause()
 
-    # === Load ===
     def load_and_transcribe(self):
+        """
+        Load an audio file and transcribe it with progress feedback.
+
+        Supports WAV, MP3, M4A, and FLAC formats. The audio is resampled
+        to 16kHz mono if necessary before transcription.
+        """
         file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Select Audio File", "", "Audio Files (*.wav *.mp3 *.m4a *.flac)"
         )
@@ -228,12 +298,13 @@ class WhisperRecorder(QtWidgets.QWidget):
             return
 
         self.text_area.append(f"\n🎧 Loading file: {file_path}\n")
-        self.cancel_flag = False
+        self._cancel.clear()
         self.cancel_btn.setEnabled(True)
         self.load_btn.setEnabled(False)
 
-        # Convert to mono/16k
+        temp_path = None
         try:
+            # Convert to mono/16k
             data, sr = soundfile.read(file_path)
             if data.ndim > 1:
                 data = np.mean(data, axis=1)
@@ -265,7 +336,7 @@ class WhisperRecorder(QtWidgets.QWidget):
         try:
             segments, _ = self.model.transcribe(temp_path, language="en")
             for segment in segments:
-                if self.cancel_flag:
+                if self._cancel.is_set():
                     self.text_area.append("\n🛑 Transcription canceled.\n")
                     progress.deleteLater()
                     self.cancel_btn.setEnabled(False)
@@ -287,6 +358,13 @@ class WhisperRecorder(QtWidgets.QWidget):
             self.cancel_btn.setEnabled(False)
             self.load_btn.setEnabled(True)
             return
+        finally:
+            # Clean up temporary file
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
 
         # Save transcript
         text = " ".join(text_segments).strip()

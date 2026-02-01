@@ -1,3 +1,10 @@
+"""
+Main application window for Whisper Notebook.
+
+This module provides the top-level window that combines the session manager
+sidebar with the whisper recorder interface.
+"""
+
 import os, sys
 from PySide6 import QtWidgets, QtCore
 from whisper_recorder import WhisperRecorder
@@ -9,20 +16,23 @@ from set_path import RECORDINGS_DIR
 
 
 class MainWindow(QtWidgets.QWidget):
-    """Main application window with collapsible session manager + recorder."""
+    """Main application window with collapsible session manager and recorder."""
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("🎙️ Whisper Notebook")
+        self.setWindowTitle("Whisper Notebook")
         self.resize(1200, 700)
 
         # === Layout ===
         main_layout = QtWidgets.QVBoxLayout(self)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+        main_layout.setSpacing(12)
 
         # --- Toolbar ---
         toolbar = QtWidgets.QHBoxLayout()
-        self.toggle_sessions_btn = QtWidgets.QPushButton("📂 Sessions")
+        self.toggle_sessions_btn = QtWidgets.QPushButton("☰  Sessions")
         self.toggle_sessions_btn.setCheckable(True)
+        self.toggle_sessions_btn.setObjectName("sessionsBtn")
         toolbar.addWidget(self.toggle_sessions_btn)
         toolbar.addStretch()
         main_layout.addLayout(toolbar)
@@ -51,10 +61,10 @@ class MainWindow(QtWidgets.QWidget):
         """Show/hide the session manager sidebar."""
         self.session_manager.setVisible(checked)
         if checked:
-            self.toggle_sessions_btn.setText("📂 Hide Sessions")
+            self.toggle_sessions_btn.setText("✕  Close")
             self.splitter.setSizes([300, 900])
         else:
-            self.toggle_sessions_btn.setText("📂 Sessions")
+            self.toggle_sessions_btn.setText("☰  Sessions")
             self.splitter.setSizes([0, 1200])
 
     # --------------------------------------------------------
@@ -84,5 +94,5 @@ class MainWindow(QtWidgets.QWidget):
         # --- Auto-close the drawer ---
         self.toggle_sessions_btn.setChecked(False)
         self.session_manager.setVisible(False)
-        self.toggle_sessions_btn.setText("📂 Sessions")
+        self.toggle_sessions_btn.setText("☰  Sessions")
 

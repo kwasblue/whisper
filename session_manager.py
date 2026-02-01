@@ -1,3 +1,10 @@
+"""
+Session management for browsing and loading recorded transcripts.
+
+This module provides a Qt widget for displaying a list of recorded sessions,
+loading metadata from JSON files, and emitting signals when sessions are selected.
+"""
+
 import os, sys, json
 from PySide6 import QtWidgets, QtCore
 from datetime import datetime
@@ -6,7 +13,15 @@ from set_path import RECORDINGS_DIR
 
 
 class SessionManager(QtWidgets.QWidget):
-    """Displays a list of recorded sessions (with metadata) and emits a signal when one is selected."""
+    """
+    A widget for browsing and selecting recorded sessions.
+
+    Displays sessions in a table with title, date, summary, and status.
+    Emits sessionSelected signal when a session is double-clicked.
+
+    Signals:
+        sessionSelected(str, str): Emitted with (audio_path, transcript_path).
+    """
     
     sessionSelected = QtCore.Signal(str, str)  # audio_path, transcript_path
 
@@ -23,15 +38,16 @@ class SessionManager(QtWidgets.QWidget):
         self.recordings_dir.mkdir(exist_ok=True, parents=True)
         print(f"📂 SessionManager using directory: {self.recordings_dir}")
 
-        self.setWindowTitle("📂 Sessions")
+        self.setWindowTitle("Sessions")
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(4)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
 
         # --- Header ---
         header_layout = QtWidgets.QHBoxLayout()
-        self.refresh_btn = QtWidgets.QPushButton("🔄 Refresh")
-        self.title_label = QtWidgets.QLabel("<b>Session Library</b>")
+        self.refresh_btn = QtWidgets.QPushButton("↻  Refresh")
+        self.title_label = QtWidgets.QLabel("Session Library")
+        self.title_label.setObjectName("titleLabel")
         header_layout.addWidget(self.title_label)
         header_layout.addStretch()
         header_layout.addWidget(self.refresh_btn)
@@ -43,6 +59,8 @@ class SessionManager(QtWidgets.QWidget):
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         layout.addWidget(self.table)
 
@@ -70,11 +88,12 @@ class SessionManager(QtWidgets.QWidget):
             try:
                 meta = json.loads(meta_file.read_text(encoding="utf-8"))
                 base_name = meta.get("source") or meta_file.stem.replace("_clean", "").replace("_transcript", "")
-                wav_path = self.recordings_dir / f"{Path(base_name).stem}.wav"
-                txt_path = self.recordings_dir / f"{Path(base_name).stem}.txt"
+                base_stem = Path(base_name).stem
+                wav_path = self.recordings_dir / f"{base_stem}.wav"
+                txt_path = self.recordings_dir / f"{base_stem}.txt"
 
                 sessions.append({
-                    "title": meta.get("title", Path(base_name).stem),
+                    "title": meta.get("title", base_stem),
                     "summary": (meta.get("summary", "")[:90] + "...") if meta.get("summary") else "",
                     "date": meta.get("timestamp", ""),
                     "status": "✨ Cleaned" if meta.get("cleaned", False) else "📝 Raw",
@@ -85,9 +104,10 @@ class SessionManager(QtWidgets.QWidget):
                 print(f"⚠️ Error reading metadata {meta_file.name}: {e}")
 
         # --- Fallback: find any unprocessed sessions ---
+        known_audio = {s["audio"] for s in sessions}
         for wav_file in self.recordings_dir.glob("*.wav"):
-            name = wav_file.stem
-            if not any(name in s["audio"] for s in sessions):
+            if str(wav_file) not in known_audio:
+                name = wav_file.stem
                 txt_path = self.recordings_dir / f"{name}.txt"
                 sessions.append({
                     "title": name,
@@ -131,6 +151,7 @@ class SessionManager(QtWidgets.QWidget):
     # HELPERS
     # ============================================================
     def _extract_date(self, name):
+        """Extract ISO date from session filename (e.g., session_20240115_143022)."""
         ts_str = name.replace("session_", "")
         try:
             dt = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
@@ -139,6 +160,7 @@ class SessionManager(QtWidgets.QWidget):
             return ""
 
     def _format_date(self, iso_str):
+        """Format ISO date string for display (e.g., 'Jan 15, 2024  14:30')."""
         try:
             dt = datetime.fromisoformat(iso_str)
             return dt.strftime("%b %d, %Y  %H:%M")
